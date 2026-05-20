@@ -1,8 +1,66 @@
 # Regulated Trade Agent — End-to-End Demo
 
-A working demo of a regulated trading agent built on three local processes plus an embedded MCP server. Every consequential action (`place_trade`) is gated by a Prepare → Approve → Commit lifecycle with cryptographically linked, signed evidence on disk.
+A working reference implementation of an MCP-resident **human-in-the-loop enforcement** pattern for regulated agentic actions. Every consequential tool call (`place_trade`) is gated by a Prepare → Approve → Commit lifecycle with cryptographically linked, signed evidence on disk. The model can't bypass it; the chat UI can't bypass it; the gate lives in server code, not prompt instructions.
+
+Trading is the example domain — the pattern carries unchanged to `send_wire`, `submit_compliance_filing`, `delete_customer_record`, or any other action that crosses a regulatory bright line.
 
 > See [DESIGN_SPEC.md](DESIGN_SPEC.md) for the full design rationale.
+
+---
+
+## Why this exists
+
+US financial services firms are entering a near-term regulatory environment that will require demonstrable human-in-the-loop control over agentic actions — not "agent makes a recommendation that a human reads," but **"agent proposes a regulated action that a verified human approves before it executes, with a tamper-evident artifact of every link in the chain."**
+
+The clearest current signal is **FINRA's 2026 Annual Regulatory Oversight Report** (Dec 2025), which dedicates a standalone subsection to AI agents and states that agents capable of acting or transacting require *"explicit human checkpoints before execution"* together with narrow scope, permissions, and operation-level audit trails. FINRA examiners are walking into firms with that document in hand now; firms that cannot demonstrate compliance with its expectations face findings, corrective action, and disciplinary exposure.
+
+Other regulatory vectors stacking on top:
+
+- **NYDFS Part 500** (Oct 2024 industry letter from Superintendent Harris) — covered entities' cybersecurity programs must include AI. Audit trails for AI access to NPI must be at an operation level; *"standard API call logs and LLM inference logs do not satisfy this requirement."*
+- **OCC Bulletin 2026-13 / SR 26-02** (Apr 2026) replaced SR 11-7. Generative and agentic AI are explicitly out of scope of the new MRM framework, but supervisors are applying MRM principles by analogy today and an interagency RFI on agentic AI has been signaled.
+- **SEC Division of Examinations** named AI governance an examination priority for 2025.
+- **GLBA Safeguards Rule** (2023 amendments) — AI agents accessing NPI are subject to the same access control, audit log, and minimum-necessary standards as human employees.
+- **CFPB / UDAAP** — incorrect output from an AI chatbot has been found to constitute a UDAAP violation. An enforced approval gate is a direct defense for any consumer-facing action.
+- **EU AI Act Article 14** — relevant for firms with EU nexus; effective for most high-risk Annex III systems Aug 2, 2026. Codifies meaningful human oversight, including explicit attention to **automation bias**.
+- **Colorado AI Act** — covers high-risk AI in financial services with developer/deployer obligations; effective Jun 30, 2026.
+
+The architectural shape regulators are converging on, across all of the above:
+
+1. **Tool-action risk classification** — documented, versioned policy that classifies tools by risk tier and oversight model.
+2. **Approval gate at the protocol layer, not the model layer** — the agent can't decide whether something needs approval and can't fabricate the approval.
+3. **Tamper-evident audit chain** tying each action to the proposing agent, the prompt context, the approver identity, the policy that flagged it, and the downstream effect.
+4. **Review-quality signal** — time-per-review, override rate, reviewer authority. "Click-OK" with 0 % override rate fails the meaningful-oversight test.
+5. **Single-use, action-bound approvals** — one approval, one specific resolved action, time-bounded.
+
+This repository implements all five inside a single MCP server plus a deterministic confirmation surface — no shared service, no platform team, no governance product. The only durable dependency is a write-once storage tier (filesystem here; S3 Object Lock / Azure Immutable Blob / GCS Bucket Lock in production).
+
+### How the implementation maps to those expectations
+
+| Expectation | Where it lives in this repo |
+|---|---|
+| Explicit human checkpoint before execution (FINRA) | `place_trade` blocks on `BROKER.elicit_url` until a signed receipt is written and verified ([place_trade.py:108](backend/mcp_server/tools/place_trade.py#L108)). |
+| Operation-level audit trail (NYDFS Part 500) | Three signed artifacts per regulated action — `order_intent`, `approval_receipt`, `execution_record` — linked by `intent_digest` and `receipt_digest`, plus an append-only `journal.ndjson` with `prev_hash` chaining ([store.py](backend/evidence/store.py), [journal.py](backend/evidence/journal.py)). |
+| Tamper-evident artifacts | RFC 8785 JCS canonicalization + Ed25519 signatures, distinct keys per signer (server vs. confirmer), independent verifier ([tools/verify.py](tools/verify.py)) that runs against disk + public keys alone. |
+| Single-use, action-bound approval | Receipt carries `intent_digest` over canonicalized intent. Atomic `O_CREAT\|O_EXCL` sentinel at `evidence/consumed/{id}` prevents replay. Receipt expires in `max_approval_age_seconds`. Verification checks 5–7 enforce all of this. |
+| Meaningful oversight, not rubber-stamping (Article 14(4)(b), automation bias) | Confirmation surface renders the *resolved* action — real ticker, real quantity, real account ID, not symbolic IDs. Receipt captures `display_manifest.rendered_digest` (SHA-256 of the exact HTML the user saw), `material_fields_shown`, `viewed_at`, and `dwell_ms` — so review-quality metrics are derivable directly from the artifact. |
+| Approver identity binding | Receipt records `approver.subject`, `auth_method`, `auth_assertion_digest`. Verification check 8 enforces `approver.subject == intent.caller.principal`. |
+| Approval surface outside the agent | Confirmation surface (port 8788) runs as a separate process. The chat UI embeds it as a sandboxed iframe with `frame-ancestors` CSP. The agent never holds the receipt-signing key; a compromised chat UI cannot fabricate a receipt that passes verification. |
+| Policy as code, external to agent reasoning | `backend/mcp_server/policy.py` registers per-tool policies (rule_id, rule_version, required material fields, max approval age, quantity caps). The LLM cannot override. |
+| Independent verification by a third party | `python tools/verify.py --approval-id <id>` reproduces the entire chain from `./evidence/` + `./keys/trust_bundle.json` and prints `[OK]` for each of 8 checks plus dwell time. |
+
+### What's stubbed for the demo vs. what production needs
+
+| Demo concession | Production substitute |
+|---|---|
+| Ed25519 keys on local disk (`./keys/`) | KMS-resident, non-exportable signing keys (AWS KMS, Azure Key Vault, GCP KMS). The MCP server gets `kms:Sign` on a single key and never holds private material. |
+| Filesystem evidence store with append-only journal | WORM object store with the same chain semantics — S3 Object Lock (Compliance mode), Azure Immutable Blob with time-based retention, or GCS Bucket Lock. MCP server role can write; nothing can delete or modify, including the same role. |
+| Hardcoded `DEMO_PRINCIPAL` as approver | OIDC against your enterprise IdP (Okta, Entra, Ping). **Step-up auth** (MFA / WebAuthn) at the moment of approval, not just session reuse. Auth assurance level recorded in the receipt. |
+| No event stream to SIEM | Emit `approval_requested`, `approval_decided`, `regulated_action_executed`, `policy_denied` events to your SIEM (Splunk, Sentinel, Chronicle, QRadar, Elastic). Detection rules: anomalous override rate, sub-second decisions, repeated denials with rephrased args (prompt-injection signal), out-of-hours approvals. **The artifact store is the system of record; the SIEM is the detection lens — not a replacement.** |
+| Single approver (1-of-1) | N-of-M approval schema in the artifact format from day one. Several US sector rules (high-value wires, biometric ID, some PHI ops) require dual control. Bolting this on later means a schema migration of the chain, which is exactly the kind of thing that breaks audits. |
+| All processes on one host | Confirmation surface and artifact store deployed in trust boundaries separate from the agent runtime. The agent's IAM principal cannot write to the artifact store; only the approval service can. |
+| Static policy in Python | Externalized policy decision point (OPA, Cedar, or vendor PDP) with versioned rule changes going through change control. |
+
+The point of the demo is to show that the architectural shape — **enforced policy gate outside the agent, deterministic confirmation surface, signed evidence chain** — works end-to-end with independent cryptographic verification, with no dependency on any vendor governance product.
 
 ---
 
