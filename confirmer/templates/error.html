@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cannot show approval</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/resize-bridge.js" defer></script>
+</head>
+<body>
+  <main class="card error">
+    <h1>Approval unavailable</h1>
+    <p>{{ message }}</p>
+    {% if approval_id %}<p class="meta">Approval ID: <code>{{ approval_id }}</code></p>{% endif %}
+  </main>
+</body>
+</html>

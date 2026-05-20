@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+# Secrets & runtime state (never commit)
+.env
+.env.local
+/keys/
+/evidence/
+
+# Editor / OS
+.DS_Store
+.claude/
+.idea/
+.vscode/

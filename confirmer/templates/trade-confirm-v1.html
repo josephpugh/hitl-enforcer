@@ -1,0 +1,30 @@
+<!-- template_id: trade-confirm — template_version: 1.0.0 -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Authorize trade — {{ approval_id }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/resize-bridge.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <h1>Authorize this trade</h1>
+    <p class="lede">By clicking <strong>Approve</strong>, you authorize the following order:</p>
+    <dl class="fields">
+      <dt>Side</dt>          <dd data-field="side">{{ side }}</dd>
+      <dt>Ticker</dt>        <dd data-field="ticker">{{ ticker }}</dd>
+      <dt>Quantity</dt>      <dd data-field="quantity">{{ quantity }}</dd>
+      <dt>Order type</dt>    <dd data-field="order_type">{{ order_type }}</dd>
+      <dt>Time in force</dt> <dd data-field="time_in_force">{{ time_in_force }}</dd>
+      <dt>Account</dt>       <dd data-field="account_id">{{ account_id }}</dd>
+    </dl>
+    <p class="meta">Approval ID: <code>{{ approval_id }}</code></p>
+    <p class="meta">Expires at: <time>{{ expires_at }}</time></p>
+    <form method="POST" action="/approve/{{ approval_id }}/decision" class="actions">
+      <button name="decision" value="approve" class="primary">Approve</button>
+      <button name="decision" value="decline" class="secondary">Decline</button>
+    </form>
+  </main>
+</body>
+</html>

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Decision recorded — {{ approval_id }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/resize-bridge.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <h1>{{ headline }}</h1>
+    <p>Approval ID: <code>{{ approval_id }}</code></p>
+    <p>Decision: <strong>{{ decision }}</strong></p>
+    <p class="meta">You can close this tab and return to chat.</p>
+  </main>
+  <script>
+    // Notify the embedding chat UI (if any) that the decision is final.
+    // The parent verifies event.origin before trusting this message.
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(
+        { type: 'hitl_decision', approval_id: {{ approval_id|tojson }}, decision: {{ decision|tojson }} },
+        '*'
+      );
+    }
+  </script>
+</body>
+</html>
