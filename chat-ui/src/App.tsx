@@ -22,6 +22,7 @@ export function App() {
   const [thinking, setThinking] = useState(false);
   const socketRef = useRef<AgentSocket | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const onFrame = (frame: ServerFrame) => {
@@ -35,8 +36,15 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    scrollerRef.current?.scrollTo({ top: scrollerRef.current.scrollHeight });
-  }, [items]);
+    const content = contentRef.current;
+    const scroller = scrollerRef.current;
+    if (!content || !scroller) return;
+    const ro = new ResizeObserver(() => {
+      scroller.scrollTo({ top: scroller.scrollHeight });
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, []);
 
   const send = () => {
     const text = input.trim();
@@ -56,15 +64,17 @@ export function App() {
         </div>
       </header>
       <div className="messages" ref={scrollerRef}>
-        {items.length === 0 && (
-          <div className="message assistant">
-            Hi — I can place stock trades. Try: <em>buy 100 ORCL</em>. Every trade requires your explicit approval.
-          </div>
-        )}
-        {items.map((item) => (
-          <Item key={item.id} item={item} />
-        ))}
-        {thinking && <div className="message assistant" style={{ opacity: 0.5 }}>…</div>}
+        <div className="messages-inner" ref={contentRef}>
+          {items.length === 0 && (
+            <div className="message assistant">
+              Hi — I can place stock trades. Try: <em>buy 100 ORCL</em>. Every trade requires your explicit approval.
+            </div>
+          )}
+          {items.map((item) => (
+            <Item key={item.id} item={item} />
+          ))}
+          {thinking && <div className="message assistant" style={{ opacity: 0.5 }}>…</div>}
+        </div>
       </div>
       <div className="composer">
         <input
