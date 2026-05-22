@@ -1,8 +1,8 @@
 """Live end-to-end test against running backend + confirmer.
 
-Drives the entire WS -> tool-call -> elicit -> HTTP-POST -> resolve -> commit
-flow exactly as a real browser would (minus the React UI). Verifies on-disk
-artifacts via the verifier afterwards.
+Drives the entire SSE -> tool-call -> elicit -> HTTP-POST -> resolve -> commit
+flow exactly as the chat UI would (minus the React rendering). Verifies
+on-disk artifacts via the verifier afterwards.
 
 Prereqs: `python -m backend` and `python -m confirmer` must be running.
 """
@@ -10,65 +10,85 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sys
-from pathlib import Path
 
 import httpx
-import websockets
 
 
-BACKEND_WS = "ws://127.0.0.1:8787/ws"
+BACKEND = "http://127.0.0.1:8787"
 CONFIRMER = "http://127.0.0.1:8788"
 
-OFFLINE_MARKER = "[OPENAI_API_KEY not set"
+
+def _parse_sse_block(block: str) -> dict | None:
+    data = ""
+    for line in block.split("\n"):
+        if line.startswith(":") or not line:
+            continue
+        if line.startswith("data:"):
+            data += line[5:].lstrip()
+    if not data:
+        return None
+    try:
+        return json.loads(data)
+    except json.JSONDecodeError:
+        return None
 
 
 async def run() -> int:
-    async with websockets.connect(BACKEND_WS) as ws:
-        await ws.send(json.dumps({"type": "user_message", "text": "buy 7 ORCL"}))
-        approval_id: str | None = None
-        approval_url: str | None = None
-        result_text: str | None = None
-        offline = False
-        while True:
-            raw = await asyncio.wait_for(ws.recv(), timeout=120)
-            frame = json.loads(raw)
-            t = frame.get("type")
-            print(f"WS<- {t}: {str(frame)[:200]}")
-            if t == "assistant_text" and OFFLINE_MARKER in frame.get("delta", ""):
-                offline = True
-            if t == "approval_required":
-                approval_id = frame["approval_id"]
-                approval_url = frame["url"]
+    approval_id: str | None = None
+    approval_url: str | None = None
+    result_text: str | None = None
 
-                # Drive an APPROVE through the confirmer HTTP API in the background.
-                async def approve():
-                    async with httpx.AsyncClient(timeout=5.0) as client:
-                        get = await client.get(approval_url)
-                        assert get.status_code == 200, f"GET {approval_url}: {get.status_code}"
-                        decide_url = f"{CONFIRMER}/approve/{approval_id}/decision"
-                        post = await client.post(decide_url, data={"decision": "approve"})
-                        assert post.status_code == 200, f"POST {decide_url}: {post.status_code}"
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        async with client.stream(
+            "POST",
+            f"{BACKEND}/chat",
+            json={"text": "buy 7 ORCL"},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            assert resp.status_code == 200, f"unexpected status {resp.status_code}"
+            buffer = ""
+            async for chunk in resp.aiter_text():
+                # Normalize CRLF; the HTML5 SSE spec allows CR, LF, or CRLF.
+                buffer += chunk.replace("\r\n", "\n").replace("\r", "\n")
+                while "\n\n" in buffer:
+                    block, buffer = buffer.split("\n\n", 1)
+                    frame = _parse_sse_block(block)
+                    if frame is None:
+                        continue
+                    t = frame.get("type")
+                    print(f"SSE<- {t}: {str(frame)[:200]}")
+                    if t == "approval_required":
+                        approval_id = frame["approval_id"]
+                        approval_url = frame["url"]
 
-                asyncio.create_task(approve())
-            if t == "tool_result":
-                result_text = frame.get("result", "")
-            if t == "assistant_done":
-                break
+                        async def approve() -> None:
+                            async with httpx.AsyncClient(timeout=5.0) as c:
+                                g = await c.get(approval_url)
+                                assert g.status_code == 200, f"GET {approval_url}: {g.status_code}"
+                                p = await c.post(
+                                    f"{CONFIRMER}/approve/{approval_id}/decision",
+                                    data={"decision": "approve"},
+                                )
+                                assert p.status_code == 200, f"POST decision: {p.status_code}"
+
+                        asyncio.create_task(approve())
+                    if t == "tool_result":
+                        result_text = frame.get("result", "")
+                    if t == "assistant_done":
+                        # Drain remainder of the stream so the server closes cleanly.
+                        break
 
     if not approval_id:
         print("FAIL: never received approval_required")
         return 1
     if not result_text or "Order filled" not in result_text:
-        # If we're in offline mode, the tool result still must indicate fill.
         print(f"FAIL: unexpected result_text: {result_text!r}")
         return 1
     print(f"\nGot approval_id: {approval_id}")
     print(f"Tool result: {result_text}")
 
-    # Now check on-disk artifacts.
-    art = httpx.get(f"http://127.0.0.1:8787/artifacts/{approval_id}").json()
+    art = httpx.get(f"{BACKEND}/artifacts/{approval_id}").json()
     assert art["intent"] is not None, "intent missing"
     assert art["receipt"] is not None, "receipt missing"
     assert art["execution"] is not None, "execution missing"

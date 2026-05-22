@@ -1,13 +1,14 @@
 """Agent backend.
 
-Hosts:
-- /mcp (Streamable HTTP MCP transport for the place_trade tool)
-- /ws  (WebSocket between chat UI and agent loop; carries the elicitation
-       events forwarded by the MCP client's elicitation_callback)
-- /elicitation/resolve/{approval_id} (HTTP callback the confirmer hits
-       after writing the receipt; resolves the in-process PENDING future)
-- /artifacts/{approval_id} (read-only artifact snapshot for the chat UI)
-- /healthz
+All transports are HTTP:
+
+- POST /chat                          — open an SSE stream for one turn
+- POST /chat/session                  — create a fresh chat session id
+- DELETE /chat/session/{session_id}   — release a chat session
+- /mcp                                — Streamable HTTP MCP transport (FastMCP)
+- POST /elicitation/resolve/{id}      — confirmer's OOB decision callback
+- GET  /artifacts/{approval_id}       — read-only artifact snapshot
+- GET  /healthz
 """
 from __future__ import annotations
 
@@ -16,13 +17,15 @@ import contextlib
 import hashlib
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
 
-from .agent.agent_loop import AgentLoop, make_session
+from .agent.agent_loop import AgentEvent, AgentLoop, ChatSession, make_session
 from .config import CONFIG
 from .crypto.keys import ensure_all_keys
 from .evidence import store
@@ -33,14 +36,25 @@ log = logging.getLogger("backend")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
+# Process-wide chat session registry. Keyed by session_id sent by the client.
+SESSIONS: dict[str, ChatSession] = {}
+SESSIONS_LOCK = asyncio.Lock()
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
-    """Run MCP session manager alongside our own startup tasks."""
+    """Run the MCP session manager alongside our own startup tasks."""
     ensure_all_keys()
     log.info("backend starting on port %d", CONFIG.agent_port)
     log.info("confirmer expected at %s", CONFIG.confirmer_base_url)
     async with MCP.session_manager.run():
-        yield
+        try:
+            yield
+        finally:
+            # Close any chat sessions that are still hanging around.
+            for sess in list(SESSIONS.values()):
+                await agent_loop.disconnect_mcp(sess)
+            SESSIONS.clear()
 
 
 app = FastAPI(title="Trade Agent Backend", lifespan=lifespan)
@@ -60,6 +74,103 @@ async def healthz() -> dict[str, Any]:
     return {"ok": True}
 
 
+# --------------------------- Chat-session lifecycle ---------------------------
+
+
+async def _get_or_create_session(session_id: str | None) -> ChatSession:
+    async with SESSIONS_LOCK:
+        if session_id and session_id in SESSIONS:
+            return SESSIONS[session_id]
+        sess = make_session(session_id=session_id)
+        SESSIONS[sess.session_id] = sess
+    # connect_mcp is async; do it outside the lock to avoid serializing setup.
+    await agent_loop.connect_mcp(sess)
+    return sess
+
+
+@app.post("/chat/session")
+async def create_chat_session() -> dict[str, str]:
+    sid = f"sess_{uuid.uuid4().hex[:12]}"
+    sess = make_session(session_id=sid)
+    SESSIONS[sid] = sess
+    await agent_loop.connect_mcp(sess)
+    return {"session_id": sid}
+
+
+@app.delete("/chat/session/{session_id}")
+async def delete_chat_session(session_id: str) -> dict[str, Any]:
+    async with SESSIONS_LOCK:
+        sess = SESSIONS.pop(session_id, None)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="unknown session")
+    await agent_loop.disconnect_mcp(sess)
+    return {"closed": True}
+
+
+# -------------------------------- Chat turn -----------------------------------
+
+
+def _sse_payload(event: AgentEvent) -> dict[str, Any]:
+    return {
+        "event": "message",
+        "data": json.dumps({"type": event.type, **event.data}),
+    }
+
+
+@app.post("/chat")
+async def chat(request: Request) -> EventSourceResponse:
+    body = await request.json()
+    text = (body.get("text") or "").strip()
+    sid = body.get("session_id")
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    sess = await _get_or_create_session(sid)
+
+    async def stream():
+        # Make sure no leftover events from a previous turn leak through.
+        while not sess.event_queue.empty():
+            try:
+                sess.event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        turn_task = asyncio.create_task(agent_loop.run_turn(sess, text))
+        try:
+            while True:
+                # Race the queue against the turn completing so we exit
+                # cleanly if the agent never emits assistant_done.
+                get_task = asyncio.create_task(sess.event_queue.get())
+                done, _ = await asyncio.wait(
+                    {get_task, turn_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if get_task in done:
+                    event = get_task.result()
+                    yield _sse_payload(event)
+                    if event.type == "assistant_done":
+                        break
+                elif turn_task in done:
+                    # Turn ended without an assistant_done sentinel: emit one
+                    # so the client side closes its turn state cleanly.
+                    if get_task and not get_task.done():
+                        get_task.cancel()
+                    yield _sse_payload(AgentEvent("assistant_done"))
+                    break
+        finally:
+            if not turn_task.done():
+                turn_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await turn_task
+
+    return EventSourceResponse(
+        stream(),
+        headers={"X-Session-Id": sess.session_id, "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------- Elicitation callback ----------------------------
+
+
 @app.post("/elicitation/resolve/{approval_id}")
 async def resolve_elicitation(approval_id: str, request: Request) -> dict[str, Any]:
     """Called by the confirmer after it writes the receipt."""
@@ -71,6 +182,9 @@ async def resolve_elicitation(approval_id: str, request: Request) -> dict[str, A
         raise HTTPException(status_code=400, detail="invalid action")
     ok = await PENDING.resolve(approval_id, action)
     return {"resolved": ok, "approval_id": approval_id, "action": action}
+
+
+# ----------------------------- Artifact snapshot ------------------------------
 
 
 def _sha256_of_file(p: Path) -> str | None:
@@ -96,87 +210,6 @@ async def get_artifacts(approval_id: str) -> dict[str, Any]:
     }
 
 
-# ------------------------- WebSocket bridge -------------------------
-
-
-async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
-    await ws.send_text(json.dumps(payload))
-
-
-async def _run_turn(ws: WebSocket, session, text: str) -> None:
-    """Drive one user message through the agent loop, forwarding events to the WS."""
-    async for event in agent_loop.handle_user_message(session, text):
-        if event.type == "assistant_text":
-            await _send_json(ws, {"type": "assistant_text", "delta": event.data.get("delta", "")})
-        elif event.type == "tool_call":
-            await _send_json(
-                ws,
-                {
-                    "type": "tool_call",
-                    "name": event.data.get("name"),
-                    "args": event.data.get("args"),
-                    "call_id": event.data.get("call_id"),
-                },
-            )
-        elif event.type == "approval_required":
-            await _send_json(
-                ws,
-                {
-                    "type": "approval_required",
-                    "approval_id": event.data.get("approval_id"),
-                    "url": event.data.get("url"),
-                    "summary": event.data.get("summary"),
-                    "expires_at": event.data.get("expires_at"),
-                },
-            )
-        elif event.type == "tool_result":
-            await _send_json(
-                ws,
-                {
-                    "type": "tool_result",
-                    "name": event.data.get("name"),
-                    "result": event.data.get("result"),
-                    "call_id": event.data.get("call_id"),
-                },
-            )
-        elif event.type == "assistant_done":
-            await _send_json(ws, {"type": "assistant_done"})
-        elif event.type == "error":
-            await _send_json(ws, {"type": "error", "message": event.data.get("message", "")})
-
-
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket) -> None:
-    await ws.accept()
-    session = make_session()
-    log.info("ws session %s connected", session.session_id)
-    try:
-        await agent_loop.connect_mcp(session)
-        while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            mtype = msg.get("type")
-            if mtype == "user_message":
-                text = msg.get("text", "")
-                if text.strip():
-                    session.elicit_sink = ws  # type: ignore[attr-defined]
-                    try:
-                        await _run_turn(ws, session, text)
-                    except Exception as exc:  # noqa: BLE001
-                        log.exception("turn error")
-                        await _send_json(ws, {"type": "error", "message": f"Agent error: {exc!r}"})
-            elif mtype == "ping":
-                await _send_json(ws, {"type": "pong"})
-    except WebSocketDisconnect:
-        log.info("ws session %s disconnected", session.session_id)
-    finally:
-        await agent_loop.disconnect_mcp(session)
-
-
 # Mount the FastMCP Streamable HTTP ASGI app LAST so its catch-all does not
-# shadow the explicit routes declared above. Its internal route is /mcp, so
-# on this FastAPI app the endpoint is at /mcp.
+# shadow the explicit routes declared above.
 app.mount("/", MCP.streamable_http_app())

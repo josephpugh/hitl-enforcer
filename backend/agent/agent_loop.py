@@ -1,11 +1,10 @@
 """Agent loop: OpenAI chat-completions driving an MCP client over Streamable HTTP.
 
-For each WebSocket session we open one MCP `ClientSession` against the local
-FastMCP endpoint at `/mcp`. The session's `elicitation_callback` is bound to
-that WS — when the MCP server's `place_trade` tool calls `ctx.elicit_url`,
-the callback forwards an `approval_required` event back to the WS and
-returns `accept` (consent to navigate; the OOB decision is signaled over
-HTTP from the confirmer).
+The chat transport between UI and backend is per-turn SSE-over-POST. Each
+chat session keeps a long-lived MCP `ClientSession` open against the local
+FastMCP endpoint at `/mcp`. The session's `elicitation_callback` writes
+straight into the same event queue the turn is draining, so URL elicitations
+from the MCP server reach the SSE response without any extra plumbing.
 """
 from __future__ import annotations
 
@@ -15,7 +14,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import Any
 
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -47,18 +46,20 @@ MCP_URL = f"http://127.0.0.1:{CONFIG.agent_port}/mcp"
 
 @dataclass
 class AgentEvent:
+    """Event written into a session's queue and emitted as one SSE frame."""
+
     type: str
     data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class AgentSession:
+class ChatSession:
     session_id: str
     principal: str
     messages: list[dict[str, Any]] = field(default_factory=list)
-    # Sink for elicitation events (set by the WS handler before each turn).
-    elicit_sink: Any | None = None
-    # MCP client plumbing (filled in by `connect_mcp`).
+    # The queue both the agent loop and the MCP client's elicitation
+    # callback push events into. Drained by the SSE response generator.
+    event_queue: asyncio.Queue[AgentEvent] = field(default_factory=asyncio.Queue)
     _mcp_stack: contextlib.AsyncExitStack | None = None
     _mcp_session: ClientSession | None = None
     _mcp_tools: list[mcp_types.Tool] = field(default_factory=list)
@@ -68,9 +69,9 @@ class AgentSession:
             self.messages.append({"role": "system", "content": SYSTEM_PROMPT})
 
 
-def make_session(principal: str | None = None) -> AgentSession:
-    return AgentSession(
-        session_id=f"sess_{uuid.uuid4().hex[:12]}",
+def make_session(session_id: str | None = None, principal: str | None = None) -> ChatSession:
+    return ChatSession(
+        session_id=session_id or f"sess_{uuid.uuid4().hex[:12]}",
         principal=principal or CONFIG.demo_principal,
     )
 
@@ -86,15 +87,6 @@ def _mcp_tool_to_openai(tool: mcp_types.Tool) -> dict[str, Any]:
     }
 
 
-async def _send_ws(ws: Any, payload: dict[str, Any]) -> None:
-    if ws is None:
-        return
-    try:
-        await ws.send_text(json.dumps(payload))
-    except Exception:  # noqa: BLE001
-        log.warning("ws send failed", exc_info=True)
-
-
 class AgentLoop:
     def __init__(self) -> None:
         self.client: AsyncOpenAI | None = (
@@ -103,33 +95,33 @@ class AgentLoop:
 
     # ------------------------------ MCP lifecycle ------------------------------
 
-    async def connect_mcp(self, session: AgentSession) -> None:
+    async def connect_mcp(self, session: ChatSession) -> None:
         stack = contextlib.AsyncExitStack()
         try:
             read, write, _ = await stack.enter_async_context(streamablehttp_client(MCP_URL))
+
+            queue = session.event_queue
 
             async def elicitation_cb(
                 context: RequestContext["ClientSession", Any],
                 params: mcp_types.ElicitRequestParams,
             ) -> mcp_types.ElicitResult | mcp_types.ErrorData:
-                # The MCP server's place_trade tool calls ctx.elicit_url. The
-                # URL travels through the protocol — not LLM prose. We forward
-                # it to the chat UI and immediately return `accept`, which is
-                # the spec-defined "consent to navigate." The actual OOB
-                # decision is signaled by the confirmer over HTTP.
+                # Forward URL-mode elicitations to the SSE stream. Return
+                # `accept` immediately — per spec the protocol response is
+                # the consent to navigate, not the OOB decision.
                 if isinstance(params, mcp_types.ElicitRequestURLParams):
-                    await _send_ws(
-                        session.elicit_sink,
-                        {
-                            "type": "approval_required",
-                            "approval_id": params.elicitationId,
-                            "url": params.url,
-                            "summary": params.message,
-                            "expires_at": "",
-                        },
+                    await queue.put(
+                        AgentEvent(
+                            "approval_required",
+                            {
+                                "approval_id": params.elicitationId,
+                                "url": params.url,
+                                "summary": params.message,
+                                "expires_at": "",
+                            },
+                        )
                     )
                     return mcp_types.ElicitResult(action="accept")
-                # Form elicitation: not used in this demo. Decline politely.
                 return mcp_types.ElicitResult(action="decline")
 
             client_session = await stack.enter_async_context(
@@ -149,7 +141,7 @@ class AgentLoop:
             await stack.aclose()
             raise
 
-    async def disconnect_mcp(self, session: AgentSession) -> None:
+    async def disconnect_mcp(self, session: ChatSession) -> None:
         stack = session._mcp_stack
         if stack is not None:
             with contextlib.suppress(Exception):
@@ -159,79 +151,92 @@ class AgentLoop:
 
     # -------------------------------- Turn loop --------------------------------
 
-    async def handle_user_message(
-        self, session: AgentSession, user_text: str
-    ) -> AsyncIterator[AgentEvent]:
+    async def run_turn(self, session: ChatSession, user_text: str) -> None:
+        """Drive one user message through the model + tools, writing events into the queue."""
+        q = session.event_queue
         session.messages.append({"role": "user", "content": user_text})
 
         if self.client is None:
-            yield AgentEvent(
-                "assistant_text",
-                {"delta": "[OPENAI_API_KEY not set — running offline]"},
+            await q.put(
+                AgentEvent(
+                    "assistant_text",
+                    {"delta": "[OPENAI_API_KEY not set — running offline]"},
+                )
             )
-            yield AgentEvent("assistant_done", {})
+            await q.put(AgentEvent("assistant_done"))
             return
 
         if session._mcp_session is None:
-            yield AgentEvent(
-                "error", {"message": "MCP client not connected for this session"}
-            )
-            yield AgentEvent("assistant_done", {})
+            await q.put(AgentEvent("error", {"message": "MCP client not connected"}))
+            await q.put(AgentEvent("assistant_done"))
             return
 
         tools = [_mcp_tool_to_openai(t) for t in session._mcp_tools]
         mcp_session = session._mcp_session
 
-        while True:
-            response = await self.client.chat.completions.create(
-                model=CONFIG.openai_model,
-                messages=session.messages,
-                tools=tools,
-                tool_choice="auto",
-            )
-            choice = response.choices[0]
-            msg = choice.message
-
-            if msg.content:
-                yield AgentEvent("assistant_text", {"delta": msg.content})
-
-            tool_calls = msg.tool_calls or []
-            assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if tool_calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ]
-            session.messages.append(assistant_msg)
-
-            if not tool_calls:
-                yield AgentEvent("assistant_done", {})
-                return
-
-            for tc in tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-                yield AgentEvent(
-                    "tool_call",
-                    {"name": tc.function.name, "args": args, "call_id": tc.id},
+        try:
+            while True:
+                response = await self.client.chat.completions.create(
+                    model=CONFIG.openai_model,
+                    messages=session.messages,
+                    tools=tools,
+                    tool_choice="auto",
                 )
-                # This blocks while the MCP server's tool awaits the OOB
-                # decision. During that wait, the elicitation_callback fires
-                # and surfaces the approval card to the chat UI.
-                result_text = await self._call_mcp_tool(mcp_session, tc.function.name, args)
-                yield AgentEvent(
-                    "tool_result",
-                    {"name": tc.function.name, "result": result_text, "call_id": tc.id},
-                )
-                session.messages.append(
-                    {"role": "tool", "tool_call_id": tc.id, "content": result_text}
-                )
+                choice = response.choices[0]
+                msg = choice.message
+
+                if msg.content:
+                    await q.put(AgentEvent("assistant_text", {"delta": msg.content}))
+
+                tool_calls = msg.tool_calls or []
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
+                session.messages.append(assistant_msg)
+
+                if not tool_calls:
+                    await q.put(AgentEvent("assistant_done"))
+                    return
+
+                for tc in tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    await q.put(
+                        AgentEvent(
+                            "tool_call",
+                            {"name": tc.function.name, "args": args, "call_id": tc.id},
+                        )
+                    )
+                    result_text = await self._call_mcp_tool(mcp_session, tc.function.name, args)
+                    await q.put(
+                        AgentEvent(
+                            "tool_result",
+                            {
+                                "name": tc.function.name,
+                                "result": result_text,
+                                "call_id": tc.id,
+                            },
+                        )
+                    )
+                    session.messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": result_text}
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("turn error")
+            await q.put(AgentEvent("error", {"message": f"Agent error: {exc!r}"}))
+            await q.put(AgentEvent("assistant_done"))
 
     async def _call_mcp_tool(
         self, mcp_session: ClientSession, name: str, args: dict[str, Any]
@@ -241,7 +246,6 @@ class AgentLoop:
         except Exception as exc:  # noqa: BLE001
             log.exception("MCP tool error")
             return f"Tool error: {exc!r}"
-        # Concatenate text content blocks; ignore non-text content for this demo.
         parts: list[str] = []
         for block in result.content:
             if isinstance(block, mcp_types.TextContent):
