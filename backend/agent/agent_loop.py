@@ -1,27 +1,29 @@
-"""Agent loop: drives OpenAI chat-completions with embedded MCP tools.
+"""Agent loop: OpenAI chat-completions driving an MCP client over Streamable HTTP.
 
-Each WS session creates one `AgentSession`. Messages persist across the
-session so the model keeps context across turns.
-
-This implementation uses chat.completions (not Responses API) because the
-tool-call loop is simpler and more battle-tested. The semantics required by
-the design spec — tool description, HITL block, structured tool result —
-are identical.
+For each WebSocket session we open one MCP `ClientSession` against the local
+FastMCP endpoint at `/mcp`. The session's `elicitation_callback` is bound to
+that WS — when the MCP server's `place_trade` tool calls `ctx.elicit_url`,
+the callback forwards an `approval_required` event back to the WS and
+returns `accept` (consent to navigate; the OOB decision is signaled over
+HTTP from the confirmer).
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator
 
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from mcp.shared.context import RequestContext
+import mcp.types as mcp_types
 from openai import AsyncOpenAI
 
 from ..config import CONFIG
-from ..mcp_server import server as mcp_server
-from ..mcp_server.tools.place_trade import CallContext
-from .openai_tools import mcp_to_openai
 
 log = logging.getLogger("agent")
 
@@ -40,10 +42,11 @@ SYSTEM_PROMPT = (
 )
 
 
+MCP_URL = f"http://127.0.0.1:{CONFIG.agent_port}/mcp"
+
+
 @dataclass
 class AgentEvent:
-    """Event yielded from the agent loop to the WS handler."""
-
     type: str
     data: dict[str, Any] = field(default_factory=dict)
 
@@ -53,6 +56,12 @@ class AgentSession:
     session_id: str
     principal: str
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # Sink for elicitation events (set by the WS handler before each turn).
+    elicit_sink: Any | None = None
+    # MCP client plumbing (filled in by `connect_mcp`).
+    _mcp_stack: contextlib.AsyncExitStack | None = None
+    _mcp_session: ClientSession | None = None
+    _mcp_tools: list[mcp_types.Tool] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -66,49 +75,114 @@ def make_session(principal: str | None = None) -> AgentSession:
     )
 
 
+def _mcp_tool_to_openai(tool: mcp_types.Tool) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.inputSchema,
+        },
+    }
+
+
+async def _send_ws(ws: Any, payload: dict[str, Any]) -> None:
+    if ws is None:
+        return
+    try:
+        await ws.send_text(json.dumps(payload))
+    except Exception:  # noqa: BLE001
+        log.warning("ws send failed", exc_info=True)
+
+
 class AgentLoop:
     def __init__(self) -> None:
-        if not CONFIG.openai_api_key:
-            self.client: AsyncOpenAI | None = None
-        else:
-            self.client = AsyncOpenAI(api_key=CONFIG.openai_api_key)
+        self.client: AsyncOpenAI | None = (
+            AsyncOpenAI(api_key=CONFIG.openai_api_key) if CONFIG.openai_api_key else None
+        )
+
+    # ------------------------------ MCP lifecycle ------------------------------
+
+    async def connect_mcp(self, session: AgentSession) -> None:
+        stack = contextlib.AsyncExitStack()
+        try:
+            read, write, _ = await stack.enter_async_context(streamablehttp_client(MCP_URL))
+
+            async def elicitation_cb(
+                context: RequestContext["ClientSession", Any],
+                params: mcp_types.ElicitRequestParams,
+            ) -> mcp_types.ElicitResult | mcp_types.ErrorData:
+                # The MCP server's place_trade tool calls ctx.elicit_url. The
+                # URL travels through the protocol — not LLM prose. We forward
+                # it to the chat UI and immediately return `accept`, which is
+                # the spec-defined "consent to navigate." The actual OOB
+                # decision is signaled by the confirmer over HTTP.
+                if isinstance(params, mcp_types.ElicitRequestURLParams):
+                    await _send_ws(
+                        session.elicit_sink,
+                        {
+                            "type": "approval_required",
+                            "approval_id": params.elicitationId,
+                            "url": params.url,
+                            "summary": params.message,
+                            "expires_at": "",
+                        },
+                    )
+                    return mcp_types.ElicitResult(action="accept")
+                # Form elicitation: not used in this demo. Decline politely.
+                return mcp_types.ElicitResult(action="decline")
+
+            client_session = await stack.enter_async_context(
+                ClientSession(read, write, elicitation_callback=elicitation_cb)
+            )
+            await client_session.initialize()
+            tools = await client_session.list_tools()
+            session._mcp_stack = stack
+            session._mcp_session = client_session
+            session._mcp_tools = list(tools.tools)
+            log.info(
+                "MCP client ready for %s with tools: %s",
+                session.session_id,
+                [t.name for t in session._mcp_tools],
+            )
+        except Exception:
+            await stack.aclose()
+            raise
+
+    async def disconnect_mcp(self, session: AgentSession) -> None:
+        stack = session._mcp_stack
+        if stack is not None:
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+        session._mcp_stack = None
+        session._mcp_session = None
+
+    # -------------------------------- Turn loop --------------------------------
 
     async def handle_user_message(
-        self,
-        session: AgentSession,
-        user_text: str,
+        self, session: AgentSession, user_text: str
     ) -> AsyncIterator[AgentEvent]:
-        """Yield events as the model thinks, calls tools, and replies."""
         session.messages.append({"role": "user", "content": user_text})
 
         if self.client is None:
-            # No API key: yield a canned response for offline tests.
             yield AgentEvent(
                 "assistant_text",
-                {"delta": "[OPENAI_API_KEY not set — running offline. " "Calling place_trade as a demo.]"},
+                {"delta": "[OPENAI_API_KEY not set — running offline]"},
             )
-            # Best-effort: parse "<verb> <qty> <ticker>" from the message.
-            parsed = _parse_offline(user_text)
-            if parsed is not None:
-                ticker, qty = parsed
-                call_id = f"call_offline_{uuid.uuid4().hex[:8]}"
-                async for ev in self._call_tool(
-                    session,
-                    name="place_trade",
-                    arguments={"ticker": ticker, "quantity": qty},
-                    call_id=call_id,
-                ):
-                    yield ev
-                yield AgentEvent("assistant_done", {})
-            else:
-                yield AgentEvent("assistant_done", {})
+            yield AgentEvent("assistant_done", {})
             return
 
-        tools = mcp_to_openai(mcp_server.list_tools())
+        if session._mcp_session is None:
+            yield AgentEvent(
+                "error", {"message": "MCP client not connected for this session"}
+            )
+            yield AgentEvent("assistant_done", {})
+            return
 
-        # Iterate the tool-call loop until the model stops requesting tools.
+        tools = [_mcp_tool_to_openai(t) for t in session._mcp_tools]
+        mcp_session = session._mcp_session
+
         while True:
-            log.info("calling model with %d messages", len(session.messages))
             response = await self.client.chat.completions.create(
                 model=CONFIG.openai_model,
                 messages=session.messages,
@@ -118,7 +192,6 @@ class AgentLoop:
             choice = response.choices[0]
             msg = choice.message
 
-            # Echo any assistant text to the client.
             if msg.content:
                 yield AgentEvent("assistant_text", {"delta": msg.content})
 
@@ -139,54 +212,41 @@ class AgentLoop:
                 yield AgentEvent("assistant_done", {})
                 return
 
-            # Execute each tool call. place_trade will block during HITL.
             for tc in tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     args = {}
-                async for ev in self._call_tool(
-                    session, name=tc.function.name, arguments=args, call_id=tc.id
-                ):
-                    yield ev
+                yield AgentEvent(
+                    "tool_call",
+                    {"name": tc.function.name, "args": args, "call_id": tc.id},
+                )
+                # This blocks while the MCP server's tool awaits the OOB
+                # decision. During that wait, the elicitation_callback fires
+                # and surfaces the approval card to the chat UI.
+                result_text = await self._call_mcp_tool(mcp_session, tc.function.name, args)
+                yield AgentEvent(
+                    "tool_result",
+                    {"name": tc.function.name, "result": result_text, "call_id": tc.id},
+                )
+                session.messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": result_text}
+                )
 
-            # Loop: feed tool results back in.
-
-    async def _call_tool(
-        self,
-        session: AgentSession,
-        name: str,
-        arguments: dict[str, Any],
-        call_id: str,
-    ) -> AsyncIterator[AgentEvent]:
-        yield AgentEvent(
-            "tool_call",
-            {"name": name, "args": arguments, "call_id": call_id},
-        )
-        ctx = CallContext(
-            principal=session.principal,
-            agent_session_id=session.session_id,
-            llm_model=CONFIG.openai_model,
-        )
+    async def _call_mcp_tool(
+        self, mcp_session: ClientSession, name: str, args: dict[str, Any]
+    ) -> str:
         try:
-            result = await mcp_server.call_tool(name, arguments, ctx)
+            result = await mcp_session.call_tool(name, args)
         except Exception as exc:  # noqa: BLE001
-            log.exception("tool error")
-            result = f"Tool error: {exc!r}"
-        yield AgentEvent(
-            "tool_result",
-            {"name": name, "result": result, "call_id": call_id},
-        )
-        session.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "content": result}
-        )
-
-
-def _parse_offline(text: str) -> tuple[str, int] | None:
-    """Tiny no-LLM parser: 'buy 100 ORCL' / 'sell 50 AAPL'."""
-    import re
-
-    m = re.search(r"\b(\d+)\s+([A-Za-z]{1,6})\b", text)
-    if m:
-        return m.group(2).upper(), int(m.group(1))
-    return None
+            log.exception("MCP tool error")
+            return f"Tool error: {exc!r}"
+        # Concatenate text content blocks; ignore non-text content for this demo.
+        parts: list[str] = []
+        for block in result.content:
+            if isinstance(block, mcp_types.TextContent):
+                parts.append(block.text)
+        text = "\n".join(parts) if parts else ""
+        if result.isError:
+            return text or "MCP tool reported an error."
+        return text

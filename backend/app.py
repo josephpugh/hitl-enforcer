@@ -1,7 +1,18 @@
-"""Agent backend: FastAPI + WebSocket bridge + elicitation callback."""
+"""Agent backend.
+
+Hosts:
+- /mcp (Streamable HTTP MCP transport for the place_trade tool)
+- /ws  (WebSocket between chat UI and agent loop; carries the elicitation
+       events forwarded by the MCP client's elicitation_callback)
+- /elicitation/resolve/{approval_id} (HTTP callback the confirmer hits
+       after writing the receipt; resolves the in-process PENDING future)
+- /artifacts/{approval_id} (read-only artifact snapshot for the chat UI)
+- /healthz
+"""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -15,13 +26,24 @@ from .agent.agent_loop import AgentLoop, make_session
 from .config import CONFIG
 from .crypto.keys import ensure_all_keys
 from .evidence import store
-from .mcp_server.elicitation import BROKER, ElicitRequest
+from .mcp_server.elicitation import PENDING
+from .mcp_server.server import MCP
 
 log = logging.getLogger("backend")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
 
-app = FastAPI(title="Trade Agent Backend")
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Run MCP session manager alongside our own startup tasks."""
+    ensure_all_keys()
+    log.info("backend starting on port %d", CONFIG.agent_port)
+    log.info("confirmer expected at %s", CONFIG.confirmer_base_url)
+    async with MCP.session_manager.run():
+        yield
+
+
+app = FastAPI(title="Trade Agent Backend", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,13 +53,6 @@ app.add_middleware(
 )
 
 agent_loop = AgentLoop()
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    ensure_all_keys()
-    log.info("backend starting on port %d", CONFIG.agent_port)
-    log.info("confirmer expected at %s", CONFIG.confirmer_base_url)
 
 
 @app.get("/healthz")
@@ -50,13 +65,12 @@ async def resolve_elicitation(approval_id: str, request: Request) -> dict[str, A
     """Called by the confirmer after it writes the receipt."""
     body = await request.json()
     action = body.get("action")
-    if action not in ("accept", "decline", "cancel"):
+    if action == "accept":
+        action = "approve"
+    if action not in ("approve", "decline", "cancel"):
         raise HTTPException(status_code=400, detail="invalid action")
-    ok = await BROKER.resolve(approval_id, action)
+    ok = await PENDING.resolve(approval_id, action)
     return {"resolved": ok, "approval_id": approval_id, "action": action}
-
-
-# ---- Read-only inspection endpoints for the Chat UI artifact viewer ----
 
 
 def _sha256_of_file(p: Path) -> str | None:
@@ -89,33 +103,11 @@ async def _send_json(ws: WebSocket, payload: dict[str, Any]) -> None:
     await ws.send_text(json.dumps(payload))
 
 
-async def _drain_elicitations(
-    ws: WebSocket, elicit_queue: asyncio.Queue[ElicitRequest]
-) -> None:
-    """Forward elicitation requests from the broker to the WS as approval_required frames."""
-    while True:
-        req = await elicit_queue.get()
-        await _send_json(
-            ws,
-            {
-                "type": "approval_required",
-                "approval_id": req.approval_id,
-                "url": req.url,
-                "summary": req.summary,
-                "expires_at": req.expires_at,
-            },
-        )
-
-
-async def _run_turn(
-    ws: WebSocket, session, text: str
-) -> None:
+async def _run_turn(ws: WebSocket, session, text: str) -> None:
     """Drive one user message through the agent loop, forwarding events to the WS."""
     async for event in agent_loop.handle_user_message(session, text):
         if event.type == "assistant_text":
-            await _send_json(
-                ws, {"type": "assistant_text", "delta": event.data.get("delta", "")}
-            )
+            await _send_json(ws, {"type": "assistant_text", "delta": event.data.get("delta", "")})
         elif event.type == "tool_call":
             await _send_json(
                 ws,
@@ -126,17 +118,31 @@ async def _run_turn(
                     "call_id": event.data.get("call_id"),
                 },
             )
+        elif event.type == "approval_required":
+            await _send_json(
+                ws,
+                {
+                    "type": "approval_required",
+                    "approval_id": event.data.get("approval_id"),
+                    "url": event.data.get("url"),
+                    "summary": event.data.get("summary"),
+                    "expires_at": event.data.get("expires_at"),
+                },
+            )
         elif event.type == "tool_result":
-            payload: dict[str, Any] = {
-                "type": "tool_result",
-                "name": event.data.get("name"),
-                "result": event.data.get("result"),
-                "call_id": event.data.get("call_id"),
-            }
-            # If the tool was place_trade, also attach the approval_id we can grep from result.
-            await _send_json(ws, payload)
+            await _send_json(
+                ws,
+                {
+                    "type": "tool_result",
+                    "name": event.data.get("name"),
+                    "result": event.data.get("result"),
+                    "call_id": event.data.get("call_id"),
+                },
+            )
         elif event.type == "assistant_done":
             await _send_json(ws, {"type": "assistant_done"})
+        elif event.type == "error":
+            await _send_json(ws, {"type": "error", "message": event.data.get("message", "")})
 
 
 @app.websocket("/ws")
@@ -144,12 +150,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     session = make_session()
     log.info("ws session %s connected", session.session_id)
-
-    elicit_queue: asyncio.Queue[ElicitRequest] = asyncio.Queue()
-    BROKER.attach_listener(elicit_queue)
-    drain_task = asyncio.create_task(_drain_elicitations(ws, elicit_queue))
-
     try:
+        await agent_loop.connect_mcp(session)
         while True:
             raw = await ws.receive_text()
             try:
@@ -160,38 +162,21 @@ async def ws_endpoint(ws: WebSocket) -> None:
             if mtype == "user_message":
                 text = msg.get("text", "")
                 if text.strip():
+                    session.elicit_sink = ws  # type: ignore[attr-defined]
                     try:
                         await _run_turn(ws, session, text)
                     except Exception as exc:  # noqa: BLE001
                         log.exception("turn error")
-                        await _send_json(
-                            ws, {"type": "error", "message": f"Agent error: {exc!r}"}
-                        )
-            elif mtype == "approval_status_check":
-                approval_id = msg.get("approval_id")
-                if approval_id:
-                    intent = store.read_intent(approval_id)
-                    receipt = store.read_receipt(approval_id)
-                    execution = store.read_execution(approval_id)
-                    await _send_json(
-                        ws,
-                        {
-                            "type": "approval_status",
-                            "approval_id": approval_id,
-                            "intent_present": intent is not None,
-                            "receipt_present": receipt is not None,
-                            "decision": (receipt or {}).get("payload", {}).get("decision"),
-                            "execution_present": execution is not None,
-                        },
-                    )
+                        await _send_json(ws, {"type": "error", "message": f"Agent error: {exc!r}"})
             elif mtype == "ping":
                 await _send_json(ws, {"type": "pong"})
     except WebSocketDisconnect:
         log.info("ws session %s disconnected", session.session_id)
     finally:
-        drain_task.cancel()
-        BROKER.detach_listener(elicit_queue)
-        try:
-            await drain_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await agent_loop.disconnect_mcp(session)
+
+
+# Mount the FastMCP Streamable HTTP ASGI app LAST so its catch-all does not
+# shadow the explicit routes declared above. Its internal route is /mcp, so
+# on this FastAPI app the endpoint is at /mcp.
+app.mount("/", MCP.streamable_http_app())

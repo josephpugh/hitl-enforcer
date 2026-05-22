@@ -2,6 +2,8 @@
 
 A working reference implementation of an MCP-resident **human-in-the-loop enforcement** pattern for regulated agentic actions. Every consequential tool call (`place_trade`) is gated by a Prepare → Approve → Commit lifecycle with cryptographically linked, signed evidence on disk. The model can't bypass it; the chat UI can't bypass it; the gate lives in server code, not prompt instructions.
 
+Built on the real **MCP Streamable HTTP transport** (spec [2025-03-26](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)) and the SDK's first-class **URL-mode elicitation** primitive (`ctx.elicit_url`) — not a hand-rolled broker.
+
 Trading is the example domain — the pattern carries unchanged to `send_wire`, `submit_compliance_filing`, `delete_customer_record`, or any other action that crosses a regulatory bright line.
 
 > See [DESIGN_SPEC.md](DESIGN_SPEC.md) for the full design rationale.
@@ -69,10 +71,10 @@ The point of the demo is to show that the architectural shape — **enforced pol
 | Component                | Port  | Stack                                |
 |--------------------------|-------|--------------------------------------|
 | Chat UI                  | 5173  | Vite + React + TypeScript            |
-| Agent backend (WS + MCP) | 8787  | Python, FastAPI, OpenAI SDK          |
+| Agent backend            | 8787  | Python, FastAPI, OpenAI SDK, MCP client + server |
 | Confirmation surface     | 8788  | Python, FastAPI, Jinja2              |
 
-The MCP server lives **in-process** with the agent backend. Per the spec it's "embedded with the agent for simplicity."
+The FastMCP server is mounted at **`http://localhost:8787/mcp`** as a real Streamable HTTP endpoint. The agent loop runs a `ClientSession` against that endpoint over loopback HTTP, so the tool surface looks identical to an external MCP host (Claude Desktop, an IDE plugin, etc.). The chat UI talks to the agent backend over WebSocket; the WS only carries elicitation events forwarded by the MCP client's callback, not the tool protocol itself.
 
 ---
 
@@ -167,19 +169,19 @@ hitl-enforcer/
 ├── .env.example
 ├── backend/
 │   ├── __main__.py          # entrypoint: python -m backend
-│   ├── app.py               # FastAPI + WebSocket + elicitation-resolve callback
+│   ├── app.py               # FastAPI; mounts FastMCP at /mcp, exposes /ws + /elicitation/resolve
 │   ├── config.py
-│   ├── agent/agent_loop.py  # OpenAI tool-call loop
+│   ├── agent/agent_loop.py  # OpenAI tool-call loop driving an MCP ClientSession
 │   ├── crypto/              # keys, JCS, sign/verify envelope
 │   ├── evidence/            # store + hash-chained journal
 │   └── mcp_server/
-│       ├── server.py
+│       ├── server.py        # FastMCP instance (Streamable HTTP)
 │       ├── policy.py
 │       ├── verify.py        # 8 verification checks
 │       ├── broker.py        # simulated fill
-│       ├── elicitation.py   # in-process MCP elicit-URL bridge
+│       ├── elicitation.py   # PENDING: per-approval-id futures the OOB callback resolves
 │       ├── intent_builder.py
-│       └── tools/place_trade.py
+│       └── tools/place_trade.py   # uses ctx.elicit_url + awaits PENDING
 ├── confirmer/
 │   ├── __main__.py
 │   ├── app.py               # FastAPI + frame-ancestors CSP + dwell capture
@@ -217,6 +219,50 @@ Each receipt is signed by the confirmer key and includes, in addition to the spe
 
 ---
 
+## How the MCP wire actually moves
+
+```
+┌───────────┐         ┌─────────────────────────────┐         ┌──────────────┐
+│  Chat UI  │   WS    │      Agent backend          │  HTTP   │  Confirmer   │
+│  (5173)   │ ◄─────► │  (8787)                     │ ◄─────► │  (8788)      │
+│           │ frames  │                             │         │              │
+└───────────┘         │  ┌───────────────────────┐  │         │ writes signed│
+                      │  │ OpenAI loop           │  │         │ receipt;     │
+                      │  │ + MCP ClientSession   │  │         │ POSTs to     │
+                      │  │   elicitation_callback│  │         │ /elicitation │
+                      │  └────────────┬──────────┘  │         │ /resolve/{id}│
+                      │   Streamable HTTP /mcp      │         └──────────────┘
+                      │   (POST + SSE)              │                  ▲
+                      │  ┌────────────▼──────────┐  │                  │ user
+                      │  │ FastMCP server        │  │                  │ click
+                      │  │   place_trade tool    │  │                  │
+                      │  │   ctx.elicit_url      │  │   sandboxed      │
+                      │  │   awaits PENDING fut  │──┼─► iframe in chat │
+                      │  └───────────────────────┘  │                  │
+                      └─────────────────────────────┘                  │
+                                                                       │
+                                                       browser loads URL
+                                                       inside iframe
+```
+
+A `place_trade` turn end-to-end:
+
+1. Chat UI sends `user_message` over WS.
+2. Agent loop calls `mcp_session.call_tool("place_trade", …)` over the Streamable HTTP `/mcp` endpoint. The MCP server returns `Content-Type: text/event-stream` and keeps the SSE connection open.
+3. The `place_trade` tool signs and writes the intent, then calls `ctx.elicit_url(message, url, elicitation_id=approval_id)`. This sends an `elicitation/create` request (mode=`url`) back to the MCP client as a server-initiated JSON-RPC message on the open SSE stream.
+4. The MCP client's `elicitation_callback` fires. It forwards the URL to the chat UI as an `approval_required` WS frame and immediately returns `ElicitResult(action="accept")` — the spec-defined "consent to navigate." The OOB decision is *not* carried by the elicitation response.
+5. The tool registers a `PENDING` future keyed by `approval_id`, then `await`s it.
+6. Chat UI renders the sandboxed iframe pointing at the confirmer's `/approve/{id}` page.
+7. User clicks Approve. The confirmer signs the receipt, writes `evidence/receipts/{id}.json`, and POSTs `{"action":"accept"}` to `http://localhost:8787/elicitation/resolve/{id}` on the agent backend.
+8. That HTTP handler calls `PENDING.resolve(approval_id, "approve")`, completing the future.
+9. The `place_trade` tool resumes — runs all 8 verification checks, atomically consumes the single-use sentinel, executes the simulated broker, writes the execution record, calls `ctx.session.send_elicit_complete(elicitation_id)` to formally close the elicitation, and returns the human summary.
+10. The MCP server emits the `tools/call` response on the same SSE stream, then closes it.
+11. The agent loop sees the tool result, feeds it back to OpenAI, streams the assistant's reply back to the chat UI as `assistant_text` / `assistant_done`.
+
+The protocol-level part (steps 2, 3, 9, 10) is plain MCP Streamable HTTP — nothing custom. The OOB part (steps 6–8) is the regulated approval surface, which is *deliberately* outside the protocol so a compromised MCP host can't fabricate a receipt that passes the server's verification.
+
+---
+
 ## Embedded confirmation surface (security model)
 
 The confirmation surface is delivered to the chat UI as a **sandboxed iframe** so the trade form appears inline in chat. Importantly, this preserves the audit story:
@@ -237,9 +283,10 @@ The confirmer sets `Content-Security-Policy: frame-ancestors 'self' http://local
 ## Notes
 
 - The agent loop uses `chat.completions` with tool-calls (not the Responses API) because the tool-call shape is simpler and the demo semantics — tool description, HITL block, structured tool result — are identical.
-- The "MCP elicitation-URL" primitive is implemented in-process via an asyncio broker (`backend/mcp_server/elicitation.py`). The confirmation surface notifies the backend over HTTP after writing the receipt; the broker then completes the awaiting future, exactly as the protocol-level elicitation-URL flow would.
+- The MCP server is a real FastMCP instance exposed over Streamable HTTP at `/mcp`. The agent loop's MCP `ClientSession` initializes against it at WS connect, lists tools, and `call_tool`s them through the wire protocol — same shape any external MCP host would see.
+- URL-mode elicitation (`ctx.elicit_url`) is the spec primitive. The protocol response carries the user's consent to navigate; the OOB decision (approve / decline) travels through the confirmer → `/elicitation/resolve/{id}` HTTP callback into the in-process `PENDING` future the tool is awaiting. When the tool completes, it calls `ctx.session.send_elicit_complete(elicitation_id)` to formally close the elicitation.
 - No HSM. Keys live on disk at `./keys/` (gitignored). The confirmer key is distinct from the server key so an auditor can attribute who signed what.
-- Conversational state lives only within a single WebSocket session (in-memory). Disconnect/refresh creates a new agent session; the evidence chain on disk is the durable record.
+- Conversational state lives only within a single WebSocket session (in-memory). Disconnect/refresh creates a new agent session and a new MCP client session; the evidence chain on disk is the durable record.
 
 ---
 
